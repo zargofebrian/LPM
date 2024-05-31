@@ -1,3 +1,4 @@
+import tempfile
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InputFile, InlineKeyboardMarkup, InlineKeyboardButton
 import logging
@@ -42,7 +43,9 @@ c.execute('''CREATE TABLE IF NOT EXISTS badwords
 c.execute('''CREATE TABLE IF NOT EXISTS filterwords
              (word TEXT PRIMARY KEY)''')
 c.execute('''CREATE TABLE IF NOT EXISTS users
-             (user_id INTEGER PRIMARY KEY, filterword_count INTEGER DEFAULT 0)''')
+             (user_id INTEGER PRIMARY KEY, 
+              filterword_count INTEGER DEFAULT 0,
+              message_count INTEGER DEFAULT 0)''')
 c.execute('''CREATE TABLE IF NOT EXISTS hashtags (
              hashtag TEXT PRIMARY KEY)''')
 
@@ -66,6 +69,13 @@ async def is_user_banned(user_id):
         logging.error(f"Error checking banned status for user {user_id}: {str(e)}")
         return False
 
+async def increment_user_message_count(user_id):
+    conn = sqlite3.connect('chat_links.db')
+    c = conn.cursor()
+    c.execute("UPDATE users SET message_count = message_count + 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    
 async def check_membership(user_id, chat_id):
     try:
         logging.info(f"Checking membership for user {user_id} in chat {chat_id}")
@@ -94,14 +104,34 @@ async def add_badword(word):
         logging.error(f"Error adding badword {word} to database: {str(e)}")
         return False
 
-async def add_filterword(word):
+async def add_filterwords(words):
     try:
-        c.execute("INSERT INTO filterwords (word) VALUES (?)", (word,))
+        # Split kata-kata berdasarkan koma
+        word_list = words.split(',')
+        added_words = []
+        ignored_words = []
+        
+        # Untuk setiap kata dalam daftar kata
+        for word in word_list:
+            word = word.strip()
+            # Periksa apakah kata sudah ada di database
+            c.execute("SELECT COUNT(*) FROM filterwords WHERE word=?", (word,))
+            result = c.fetchone()
+            if result[0] == 0:
+                # Jika kata belum ada, masukkan ke database
+                c.execute("INSERT INTO filterwords (word) VALUES (?)", (word,))
+                added_words.append(word)
+            else:
+                # Jika kata sudah ada, tambahkan ke daftar yang diabaikan
+                ignored_words.append(word)
+        
         conn.commit()
-        return True
+        
+        return added_words, ignored_words
     except Exception as e:
-        logging.error(f"Error adding filterword {word} to database: {str(e)}")
-        return False
+        logging.error(f"Error adding filterwords to database: {str(e)}")
+        return [], []
+
 
 async def remove_filterword(word):
     try:
@@ -245,22 +275,28 @@ def check_message_conditions(message, hashtags):
     conditions_met = any(hashtag in message_text for hashtag in hashtags)
     return conditions_met, message_text
 
-def fetch_table_contents(table_name):
-    try:
-        c.execute(f'SELECT * FROM {table_name}')
-        rows = c.fetchall()
-        return rows
-    except Exception as e:
-        logging.error(f"Error fetching contents from {table_name}: {str(e)}")
-        return []
+def fetch_table_contents(table):
+    conn = sqlite3.connect('chat_links.db')
+    c = conn.cursor()
+    c.execute(f"SELECT * FROM {table}")
+    contents = c.fetchall()
+    c.close()
+    conn.close()
+    return contents
 
-def create_csv_file(data, table_name):
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow([i[0] for i in c.description])  # Menulis header
-    writer.writerows(data)
-    output.seek(0)
-    return types.InputFile(output, f"{table_name}.csv")
+# Function to create a CSV file
+def create_csv_file_with_message_count(contents, table):
+    temp_dir = tempfile.gettempdir()
+    csv_file_path = os.path.join(temp_dir, f"{table}.csv")
+    conn = sqlite3.connect('chat_links.db')
+    c = conn.cursor()
+    with open(csv_file_path, 'w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow([desc[0] for desc in c.execute(f"PRAGMA table_info({table})").fetchall()])  # Write column names
+        for row in contents:
+            writer.writerow(row)
+    conn.close()
+    return csv_file_path
 
 
 class CombinedMiddleware(BaseMiddleware):
@@ -278,7 +314,7 @@ class CombinedMiddleware(BaseMiddleware):
         await save_user(user_id)
 
         if await is_user_banned(user_id):
-            await message.reply("KAMU TELAH DI BANNED, silahkan mengajukan unban ke admin jika diperlukan.")
+            await message.reply("KAMU TELAH DI BANNED, silahkan mengajukan permohonan unban ke admin jika diperlukan.")
             raise CancelHandler()
 
         chat_links = get_chat_links()
@@ -311,6 +347,9 @@ class CombinedMiddleware(BaseMiddleware):
             else:
                 remaining_warnings = 3 - count
                 await message.reply(f"PERINGATAN: Pesanmu mengandung kata-kata yang dilarang. Jika kamu masih mengirim kata terlarang sebanyak {remaining_warnings} kali lagi, kamu akan di-ban!")
+
+        # Increment message count for the user
+        await increment_user_message_count(user_id)
 
 @dp.message_handler(commands=['onbot'])
 async def cmd_onbot(message: types.Message):
@@ -507,11 +546,15 @@ async def cmd_add_filterword(message: types.Message):
         await message.reply("Gunakan perintah ini dengan mereply pesan yang berisi kata yang ingin ditambahkan sebagai filterword.")
         return
 
-    word = message.reply_to_message.text.strip()
-    if await add_filterword(word):
-        await message.reply(f"Kata '{word}' berhasil ditambahkan ke filterwords.")
-    else:
-        await message.reply(f"Gagal menambahkan kata '{word}' ke filterwords.")
+    words = message.reply_to_message.text.strip()
+    added, ignored = await add_filterwords(words)
+
+    if added:
+        added_str = ", ".join(added)
+        await message.reply(f"Kata '{added_str}' berhasil ditambahkan ke filterwords.")
+    if ignored:
+        ignored_str = ", ".join(ignored)
+        await message.reply(f"Kata '{ignored_str}' sudah ada di filterwords dan tidak ditambahkan.")
 
 # Tambah command handler untuk menghapus filterword
 @dp.message_handler(commands=['removefilterword'])
@@ -625,12 +668,14 @@ async def cmd_check_all_db(message: types.Message):
         contents = fetch_table_contents(table)
         if contents:
             if table == 'users':
-                # Kirim tabel users sebagai file
-                await message.reply_document(create_csv_file(contents, table), caption=f"Isi tabel {table}")
+                # Send users table as file
+                csv_file_path = create_csv_file_with_message_count(contents, table)
+                await message.reply_document(open(csv_file_path, 'rb'), caption=f"Isi tabel {table}")
+                os.remove(csv_file_path)  # Clean up the temporary file after sending
             else:
-                # Kirim tabel lain sebagai pesan terpisah
+                # Send other tables as separate messages
                 response = [f"Isi tabel {table}:"]
-                columns = [desc[0] for desc in c.description]  # Get column names
+                columns = [desc[1] for desc in sqlite3.connect('chat_links.db').cursor().execute(f"PRAGMA table_info({table})").fetchall()]  # Get column names
                 response.append(", ".join(columns))  # Add header
 
                 for row in contents:
@@ -718,4 +763,4 @@ async def reply_to_user(message: types.Message):
             await bot.send_sticker(original_user_id, sticker=message.sticker.file_id)
         else:
             await bot.send_message(original_user_id, "Received a message type that I can't handle!")
-        logging.info(f"Reply sent to user: {original_user_id} with content type: {message.content_type}"
+        logging.info(f"Reply sent to user: {original_user_id} with content type: {message.content_type}")
